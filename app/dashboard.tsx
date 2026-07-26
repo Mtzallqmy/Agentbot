@@ -298,12 +298,27 @@ function Login({ apiBase, setApiBase, online, checking, onLogin }: {
       setError("أدخل بريد المالك وكلمة المرور أولاً.");
       return;
     }
-    if (normalizedApi && !/^https?:\/\/[^/\s]+/i.test(normalizedApi)) {
-      setError("عنوان الخادم غير صالح. استخدم رابطاً كاملاً مثل https://api.example.com");
+    let parsedApi: URL | null = null;
+    if (normalizedApi) {
+      try {
+        parsedApi = new URL(normalizedApi);
+      } catch {
+        setError("عنوان الخادم غير صالح. استخدم رابطاً كاملاً مثل https://api.example.com");
+        return;
+      }
+      if (!["http:", "https:"].includes(parsedApi.protocol) || parsedApi.username || parsedApi.password) {
+        setError("عنوان الخادم غير صالح. استخدم رابط HTTP(S) من دون بيانات دخول داخله.");
+        return;
+      }
+    }
+    if (window.location.protocol === "https:" && parsedApi?.protocol === "http:") {
+      setError("يجب أن يستخدم الخادم HTTPS لأن الواجهة منشورة باتصال آمن.");
       return;
     }
-    if (window.location.protocol === "https:" && normalizedApi.startsWith("http://")) {
-      setError("يجب أن يستخدم الخادم HTTPS لأن الواجهة منشورة باتصال آمن.");
+    if (parsedApi?.origin === window.location.origin) {
+      setError(
+        "هذا رابط واجهة الويب، وليس Backend. يلزم رابط HTTPS منفصل لخدمة FastAPI المنشورة.",
+      );
       return;
     }
     if (!normalizedApi && window.location.hostname.endsWith(".chatgpt.site")) {
