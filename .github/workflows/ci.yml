@@ -36,7 +36,7 @@ jobs:
     env:
       APP_ENV: testing
       APP_SECRET_KEY: test-only-secret-not-for-production
-      ENCRYPTION_MASTER_KEY: 3YjGpFKh7GGqeXaNfK57FDY3D_FdI7_ZJbRve6awqPg=
+      ENCRYPTION_MASTER_KEY: ci-test-encryption-key
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/ai_platform_test
       REDIS_URL: redis://localhost:6379/0
       TELEGRAM_WEBHOOK_SECRET: test-webhook-secret
