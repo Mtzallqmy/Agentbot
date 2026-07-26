@@ -8,7 +8,7 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456789:test-token-for-unit-tests
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import EditMessageText
-from platform_bot.handlers import menu_action
+from platform_bot.handlers import fallback_message, menu_action
 
 
 async def test_repeated_menu_action_is_idempotent() -> None:
@@ -44,3 +44,12 @@ async def test_concurrent_repeated_tap_ignores_telegram_noop_error() -> None:
 
     query.answer.assert_awaited_once()
     message.edit_text.assert_awaited_once()
+
+
+async def test_unknown_message_returns_main_menu_hint() -> None:
+    message = SimpleNamespace(answer=AsyncMock())
+
+    await fallback_message(message)
+
+    message.answer.assert_awaited_once()
+    assert "/menu" in message.answer.await_args.args[0]

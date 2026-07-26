@@ -8,6 +8,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -70,6 +71,19 @@ async def menu_action(query: CallbackQuery) -> None:
             except TelegramBadRequest as exc:
                 if "message is not modified" not in str(exc):
                     raise
+
+
+@router.my_chat_member()
+async def membership_update(_: ChatMemberUpdated) -> None:
+    """Acknowledge Telegram membership updates without starting user flows."""
+
+
+@router.message()
+async def fallback_message(message: Message) -> None:
+    await message.answer(
+        "لم أتعرف على هذا الطلب بعد. استخدم /menu لفتح القائمة الرئيسية.",
+        reply_markup=menu(),
+    )
 
 
 dispatcher.include_router(router)
