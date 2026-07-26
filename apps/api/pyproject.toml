@@ -16,7 +16,7 @@ dependencies = [
   "redis>=5.2,<7",
   "prometheus-client>=0.21,<1",
   "python-multipart>=0.0.20,<1",
-  "structlog>=24.4,<26",
+  "structlog>=24.4,<27",
   "argon2-cffi>=23.1,<26",
 ]
 
