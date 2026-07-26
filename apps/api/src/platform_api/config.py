@@ -68,8 +68,6 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    # Values are populated by BaseSettings from the environment; the Pydantic
-    # mypy plugin cannot infer Field defaults across every supported version.
-    settings = Settings()  # type: ignore[call-arg]
+    settings = Settings()
     settings.validate_production()
     return settings

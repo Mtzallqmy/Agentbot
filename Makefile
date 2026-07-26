@@ -29,7 +29,7 @@ seed-admin: ## Initialize the configured owner account
 	./scripts/seed-admin.sh
 
 test: ## Run backend and frontend tests
-	python -m pytest -c apps/api/pyproject.toml apps/api/tests apps/worker/tests
+	python -m pytest -c apps/api/pyproject.toml apps/api/tests apps/bot/tests apps/worker/tests
 	npm test
 
 lint: ## Run backend and frontend linters

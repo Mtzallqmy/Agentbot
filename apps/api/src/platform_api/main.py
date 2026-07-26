@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +37,9 @@ def create_app() -> FastAPI:
         )
 
     @app.middleware("http")
-    async def request_context(request: Request, call_next):
+    async def request_context(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
         request_id = request.headers.get("x-request-id", str(uuid.uuid4()))[:128]
         started = time.perf_counter()
         try:

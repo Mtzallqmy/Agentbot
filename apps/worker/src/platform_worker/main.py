@@ -22,14 +22,15 @@ engine = create_async_engine(database_url, pool_pre_ping=True)
 sessions = async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def _command(*args: str, timeout: int = 300) -> tuple[str, str]:
+async def _command(*args: str, timeout_seconds: int = 300) -> tuple[str, str]:
+    temporary_root = tempfile.gettempdir()
     process = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env={"PATH": os.environ.get("PATH", ""), "HOME": "/tmp"},
+        env={"PATH": os.environ.get("PATH", ""), "HOME": temporary_root},
     )
-    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
     if process.returncode:
         raise RuntimeError(stderr.decode(errors="replace")[-2000:])
     return stdout.decode(), stderr.decode()
@@ -43,7 +44,7 @@ async def analyze_media(job: Job) -> dict[str, Any]:
         "--skip-download",
         "--no-warnings",
         str(job.payload["url"]),
-        timeout=60,
+        timeout_seconds=60,
     )
     data = json.loads(stdout)
     formats = [
@@ -77,7 +78,7 @@ async def process_media(job: Job) -> dict[str, Any]:
         "--skip-download",
         "--no-warnings",
         str(job.payload["url"]),
-        timeout=60,
+        timeout_seconds=60,
     )
     metadata = json.loads(metadata_stdout)
     duration = float(metadata.get("duration") or 0)
@@ -96,13 +97,15 @@ async def process_media(job: Job) -> dict[str, Any]:
         "-o",
         str(source_template),
         str(job.payload["url"]),
-        timeout=int(os.environ.get("MEDIA_DOWNLOAD_TIMEOUT", "900")),
+        timeout_seconds=int(os.environ.get("MEDIA_DOWNLOAD_TIMEOUT", "900")),
     )
     sources = [path for path in output_dir.glob("source.*") if path.is_file()]
     if len(sources) != 1:
         raise RuntimeError("download_output_missing")
     source = sources[0]
-    extension = str(job.payload.get("format") or ("mp3" if job.payload["mode"] == "audio" else "mp4"))
+    extension = str(
+        job.payload.get("format") or ("mp3" if job.payload["mode"] == "audio" else "mp4")
+    )
     output = output_dir / f"output.{extension}"
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
     start = job.payload.get("start_seconds")
@@ -124,9 +127,14 @@ async def process_media(job: Job) -> dict[str, Any]:
     elif extension == "webm":
         command.extend(["-c:v", "libvpx-vp9", "-c:a", "libopus", "-deadline", "realtime"])
     else:
-        command.extend(["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart"])
+        command.extend(
+            ["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart"]
+        )
     command.append(str(output))
-    await _command(*command, timeout=int(os.environ.get("MEDIA_PROCESS_TIMEOUT", "1200")))
+    await _command(
+        *command,
+        timeout_seconds=int(os.environ.get("MEDIA_PROCESS_TIMEOUT", "1200")),
+    )
     source.unlink(missing_ok=True)
     if not output.is_file():
         raise RuntimeError("processed_output_missing")
@@ -146,7 +154,8 @@ async def agent_run(job: Job) -> dict[str, Any]:
     # The MVP run creates an isolated non-shared workspace and a verifiable plan file.
     # Command/network tools are deliberately unavailable until an approval-aware
     # container sandbox is attached.
-    base = Path(os.environ.get("AGENT_WORKSPACE_ROOT", "/tmp/agent-workspaces")).resolve()
+    default_workspace_root = str(Path(tempfile.gettempdir()) / "agent-workspaces")
+    base = Path(os.environ.get("AGENT_WORKSPACE_ROOT", default_workspace_root)).resolve()
     base.mkdir(parents=True, exist_ok=True)
     workspace = Path(tempfile.mkdtemp(prefix="run-", dir=base))
     plan = workspace / "PLAN.md"

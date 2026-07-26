@@ -20,7 +20,6 @@ os.environ.update(
 
 import pytest
 from fastapi.testclient import TestClient
-
 from platform_api.db import engine
 from platform_api.main import app
 from platform_api.models import Base

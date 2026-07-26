@@ -4,7 +4,6 @@ Revision ID: 0001
 Revises:
 """
 from alembic import op
-
 from platform_api.models import Base
 
 revision = "0001"

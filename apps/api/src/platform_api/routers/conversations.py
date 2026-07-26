@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -129,7 +130,7 @@ async def create_message(
         if value is not None
     }
 
-    async def events():
+    async def events() -> AsyncIterator[str]:
         chunks: list[str] = []
         started = time.perf_counter()
         try:

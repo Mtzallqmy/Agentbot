@@ -8,6 +8,7 @@ import secrets
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 from .config import Settings
 
@@ -51,8 +52,12 @@ def decode_token(token: str, settings: Settings) -> dict[str, object]:
         expected = _b64(hmac.new(secret.encode(), content.encode(), hashlib.sha256).digest())
         if not hmac.compare_digest(signature, expected):
             raise ValueError("Invalid signature")
-        decoded = json.loads(_unb64(payload))
-        if decoded.get("exp", 0) < int(time.time()):
+        decoded_raw: object = json.loads(_unb64(payload))
+        if not isinstance(decoded_raw, dict):
+            raise ValueError("Invalid payload")
+        decoded = cast(dict[str, object], decoded_raw)
+        expires_at = decoded.get("exp")
+        if not isinstance(expires_at, (int, float)) or expires_at < int(time.time()):
             raise ValueError("Expired")
         uuid.UUID(str(decoded["sub"]))
         if not isinstance(decoded.get("jti"), str):

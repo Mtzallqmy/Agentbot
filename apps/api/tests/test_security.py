@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from platform_api.security import SecretBox, mask_secret, validate_outbound_url
 
 

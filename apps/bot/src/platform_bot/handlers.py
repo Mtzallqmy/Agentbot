@@ -4,6 +4,7 @@ import os
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -60,7 +61,15 @@ async def menu_action(query: CallbackQuery) -> None:
     }
     await query.answer()
     if query.message:
-        await query.message.edit_text(labels.get(query.data or "", "الخيار غير متاح"), reply_markup=menu())
+        target_text = labels.get(query.data or "", "الخيار غير متاح")
+        # Telegram rejects no-op edits with "message is not modified". Treat a
+        # repeated tap (including concurrent taps) as an idempotent success.
+        if query.message.text != target_text:
+            try:
+                await query.message.edit_text(target_text, reply_markup=menu())
+            except TelegramBadRequest as exc:
+                if "message is not modified" not in str(exc):
+                    raise
 
 
 dispatcher.include_router(router)
