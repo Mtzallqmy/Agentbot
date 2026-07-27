@@ -1,8 +1,7 @@
 interface Env {
   DB: D1Database;
+  BUCKET: R2Bucket;
   ENCRYPTION_MASTER_KEY?: string;
-  TELEGRAM_BOT_TOKEN?: string;
-  TELEGRAM_WEBHOOK_SECRET?: string;
 }
 
 type AuthUser = { id: string; email: string; fullName: string | null; role: string };
@@ -37,6 +36,34 @@ export async function handleEdgeApi(request: Request, env: Env): Promise<Respons
     }
     if (url.pathname === "/api/edge/providers" && request.method === "POST") {
       return createProvider(request, env, user);
+    }
+
+    if (url.pathname === "/api/edge/files" && request.method === "GET") {
+      const rows = await env.DB.prepare(
+        "SELECT id, file_name, content_type, size_bytes, status, created_at FROM stored_files WHERE owner_id = ? AND status = 'ready' ORDER BY created_at DESC LIMIT 100",
+      ).bind(user.id).all();
+      return json(rows.results);
+    }
+    if (url.pathname === "/api/edge/files" && request.method === "POST") {
+      return uploadFile(request, env, user);
+    }
+    const fileContentRoute = url.pathname.match(/^\/api\/edge\/files\/([^/]+)\/content$/);
+    if (fileContentRoute && request.method === "GET") {
+      return downloadFile(fileContentRoute[1], env, user);
+    }
+    const fileDeleteRoute = url.pathname.match(/^\/api\/edge\/files\/([^/]+)$/);
+    if (fileDeleteRoute && request.method === "DELETE") {
+      return deleteFile(fileDeleteRoute[1], env, user);
+    }
+
+    if (url.pathname === "/api/edge/telegram/status" && request.method === "GET") {
+      return telegramStatus(request, env, user);
+    }
+    if (url.pathname === "/api/edge/telegram/configure" && request.method === "POST") {
+      return configureTelegram(request, env, user);
+    }
+    if (url.pathname === "/api/edge/telegram/configure" && request.method === "DELETE") {
+      return disconnectTelegram(env, user);
     }
 
     const providerTest = url.pathname.match(/^\/api\/edge\/providers\/([^/]+)\/test$/);
@@ -97,6 +124,8 @@ export async function handleEdgeApi(request: Request, env: Env): Promise<Respons
         countOwned(env, "background_jobs", user.id),
         env.DB.prepare("SELECT COUNT(*) AS value FROM background_jobs WHERE owner_id = ? AND status = 'failed'").bind(user.id).first<{ value: number }>(),
         countOwned(env, "ai_providers", user.id),
+        countOwned(env, "stored_files", user.id),
+        telegramConfigured(env, user.id),
       ]);
       return json({
         users: metrics[0],
@@ -104,10 +133,12 @@ export async function handleEdgeApi(request: Request, env: Env): Promise<Respons
         jobs: metrics[2],
         failed_jobs: Number(metrics[3]?.value || 0),
         providers: metrics[4],
+        files: metrics[5],
         database: 1,
+        object_storage: 1,
         edge_api: 1,
         container_worker: 0,
-        telegram_webhook: env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_WEBHOOK_SECRET ? 1 : 0,
+        telegram_webhook: metrics[6] ? 1 : 0,
       });
     }
     return problem(404, "المسار غير موجود.");
@@ -139,7 +170,7 @@ async function createProvider(request: Request, env: Env, user: AuthUser): Promi
   const body = await bodyJson<{ name?: string; base_url?: string; api_key?: string; compatibility?: string; default_model?: string }>(request);
   const name = cleanText(body.name, 80);
   const apiKey = body.api_key?.trim();
-  const baseUrl = validateExternalHttpsUrl(body.base_url);
+  const baseUrl = normalizeProviderBaseUrl(body.base_url);
   if (!name || !apiKey || !baseUrl) return problem(422, "تحقق من الاسم وBase URL الآمن والمفتاح.");
   const encrypted = await encryptSecret(apiKey, env.ENCRYPTION_MASTER_KEY);
   const id = crypto.randomUUID();
@@ -155,21 +186,56 @@ async function testProvider(id: string, env: Env, user: AuthUser): Promise<Respo
   const provider = await ownedProvider(id, env, user);
   if (!provider) return problem(404, "المزود غير موجود.");
   const key = await decryptSecret(provider.encrypted_key, requiredKey(env));
-  const response = await fetch(`${provider.base_url.replace(/\/$/, "")}/models`, {
-    headers: { authorization: `Bearer ${key}`, accept: "application/json" },
-    signal: AbortSignal.timeout(12000),
+  const headers = providerHeaders(key);
+  const response = await fetch(`${provider.base_url}/models`, {
+    headers,
+    signal: AbortSignal.timeout(15000),
   });
-  if (!response.ok) return problem(502, `رفض المزود الاختبار بالحالة ${response.status}.`);
-  const payload = await response.json() as { data?: Array<{ id?: string }> };
-  const models = (payload.data || []).filter((item) => item.id).slice(0, 500);
+  let models: Array<{ id: string }> = [];
+  let listingSupported = false;
+  if (response.ok) {
+    const payload = await response.json() as unknown;
+    models = extractModelIds(payload).slice(0, 500).map((modelId) => ({ id: modelId }));
+    listingSupported = true;
+  } else if (provider.default_model) {
+    const probe = await fetch(`${provider.base_url}/chat/completions`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: provider.default_model,
+        messages: [{ role: "user", content: "Reply with OK." }],
+        max_tokens: 3,
+        temperature: 0,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!probe.ok) {
+      const detail = await safeUpstreamError(probe);
+      return problem(502, `فشل توافق المزود (${probe.status}): ${detail}`);
+    }
+    models = [{ id: provider.default_model }];
+  } else {
+    return problem(422, "المزود لا يعرض قائمة النماذج. أدخل معرف النموذج الافتراضي ثم أعد الاختبار.");
+  }
   const now = new Date().toISOString();
   for (const model of models) {
     await env.DB.prepare(
       "INSERT INTO ai_models (id, provider_id, model_id, capabilities_json, created_at, updated_at) VALUES (?, ?, ?, '{}', ?, ?) ON CONFLICT(provider_id, model_id) DO UPDATE SET updated_at = excluded.updated_at",
     ).bind(crypto.randomUUID(), id, model.id, now, now).run();
   }
+  if (!provider.default_model && models[0]?.id) {
+    await env.DB.prepare("UPDATE ai_providers SET default_model = ?, updated_at = ? WHERE id = ? AND owner_id = ?")
+      .bind(models[0].id, now, id, user.id).run();
+  }
   await audit(env, user.id, "provider.test", "ai_provider", id, { models_count: models.length });
-  return json({ ok: true, models_count: models.length });
+  return json({
+    ok: true,
+    models_count: models.length,
+    models: models.map((model) => model.id),
+    listing_supported: listingSupported,
+    default_model: provider.default_model || models[0]?.id || null,
+  });
 }
 
 async function createMessage(conversationId: string, request: Request, env: Env, user: AuthUser): Promise<Response> {
@@ -177,11 +243,14 @@ async function createMessage(conversationId: string, request: Request, env: Env,
     "SELECT c.id, c.provider_id, c.model_id FROM conversations c WHERE c.id = ? AND c.owner_id = ?",
   ).bind(conversationId, user.id).first<{ id: string; provider_id: string | null; model_id: string | null }>();
   if (!conversation) return problem(404, "المحادثة غير موجودة.");
-  const body = await bodyJson<{ content?: string }>(request);
+  const body = await bodyJson<{ content?: string; attachment_ids?: string[]; provider_id?: string; model_id?: string }>(request);
   const content = cleanText(body.content, 50000);
-  if (!content) return problem(422, "محتوى الرسالة مطلوب.");
+  const attachmentIds = Array.isArray(body.attachment_ids)
+    ? [...new Set(body.attachment_ids.filter((value) => typeof value === "string"))].slice(0, 8)
+    : [];
+  if (!content && attachmentIds.length === 0) return problem(422, "اكتب رسالة أو أرفق ملفاً.");
 
-  let providerId = conversation.provider_id;
+  let providerId = cleanText(body.provider_id, 80) || conversation.provider_id;
   if (!providerId) {
     const first = await env.DB.prepare(
       "SELECT id FROM ai_providers WHERE owner_id = ? AND enabled = 1 ORDER BY created_at LIMIT 1",
@@ -191,33 +260,50 @@ async function createMessage(conversationId: string, request: Request, env: Env,
   if (!providerId) return problem(409, "أضف مزود ذكاء اصطناعي واختبره أولاً.");
   const provider = await ownedProvider(providerId, env, user);
   if (!provider) return problem(409, "المزود المحدد غير متاح.");
-  const model = conversation.model_id || provider.default_model;
+  const model = cleanText(body.model_id, 180) || conversation.model_id || provider.default_model;
   if (!model) return problem(409, "حدد نموذجاً افتراضياً للمزود.");
 
   const now = new Date().toISOString();
+  const userMessageId = crypto.randomUUID();
   await env.DB.prepare(
     "INSERT INTO messages (id, conversation_id, role, content, status, created_at, updated_at) VALUES (?, ?, 'user', ?, 'completed', ?, ?)",
-  ).bind(crypto.randomUUID(), conversationId, content, now, now).run();
+  ).bind(userMessageId, conversationId, content || "مرفقات", now, now).run();
+  const attachmentContent = await buildAttachmentContent(attachmentIds, env, user, userMessageId);
   const history = await env.DB.prepare(
     "SELECT role, content FROM messages WHERE conversation_id = ? AND status = 'completed' ORDER BY created_at DESC LIMIT 30",
   ).bind(conversationId).all<{ role: string; content: string }>();
-  const messages = [...history.results].reverse();
+  const messages: Array<{ role: string; content: string | Array<Record<string, unknown>> }> = [...history.results].reverse();
+  if (attachmentContent.length > 0) {
+    messages[messages.length - 1] = {
+      role: "user",
+      content: [
+        ...(content ? [{ type: "text", text: content }] : []),
+        ...attachmentContent,
+      ],
+    };
+  }
   const key = await decryptSecret(provider.encrypted_key, requiredKey(env));
   const started = Date.now();
   const upstream = await fetch(`${provider.base_url.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
-    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    headers: { ...providerHeaders(key), "content-type": "application/json" },
     body: JSON.stringify({ model, messages, stream: false }),
     signal: AbortSignal.timeout(90000),
   });
-  const payload = await upstream.json() as {
+  let payload: {
     id?: string;
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number };
     error?: { message?: string };
   };
+  try {
+    payload = await upstream.json() as typeof payload;
+  } catch {
+    return problem(502, `أعاد المزود استجابة غير صالحة بصيغة غير JSON (HTTP ${upstream.status}).`);
+  }
   if (!upstream.ok) return problem(502, `فشل المزود بالحالة ${upstream.status}: ${cleanText(payload.error?.message, 180) || "خطأ منقّح"}`);
-  const answer = payload.choices?.[0]?.message?.content || "";
+  const answer = normalizeAssistantContent(payload.choices?.[0]?.message?.content);
+  if (!answer) return problem(502, "اتصل المزود لكنه لم يُرجع محتوى نصياً قابلاً للعرض.");
   await env.DB.prepare(
     "INSERT INTO messages (id, conversation_id, role, content, provider_request_id, prompt_tokens, completion_tokens, latency_ms, status, created_at, updated_at) VALUES (?, ?, 'assistant', ?, ?, ?, ?, ?, 'completed', ?, ?)",
   ).bind(crypto.randomUUID(), conversationId, answer, payload.id || null, payload.usage?.prompt_tokens || null, payload.usage?.completion_tokens || null, Date.now() - started, now, now).run();
@@ -227,8 +313,9 @@ async function createMessage(conversationId: string, request: Request, env: Env,
 }
 
 async function telegramWebhook(request: Request, env: Env): Promise<Response> {
-  if (!env.TELEGRAM_WEBHOOK_SECRET || !env.TELEGRAM_BOT_TOKEN) return problem(503, "تكامل Telegram غير مهيأ.");
-  if (!constantTimeEqual(request.headers.get("x-telegram-bot-api-secret-token") || "", env.TELEGRAM_WEBHOOK_SECRET)) {
+  const credentials = await loadTelegramCredentials(env);
+  if (!credentials) return problem(503, "تكامل Telegram غير مهيأ.");
+  if (!constantTimeEqual(request.headers.get("x-telegram-bot-api-secret-token") || "", credentials.webhookSecret)) {
     return problem(401, "Webhook secret غير صالح.");
   }
   const update = await bodyJson<{ update_id?: number; message?: { chat?: { id?: number }; text?: string } }>(request);
@@ -244,7 +331,7 @@ async function telegramWebhook(request: Request, env: Env): Promise<Response> {
     const text = update.message?.text?.startsWith("/start")
       ? "مرحباً بك في مِداد AI. افتح المنصة لإدارة المحادثات والمزودات والمهام بأمان."
       : "تم استلام رسالتك. إدارة الذكاء الاصطناعي والوكيل متاحة من منصة مِداد.";
-    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    await fetch(`https://api.telegram.org/bot${credentials.botToken}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text }),
@@ -252,6 +339,243 @@ async function telegramWebhook(request: Request, env: Env): Promise<Response> {
     });
   }
   return json({ ok: true });
+}
+
+async function configureTelegram(request: Request, env: Env, user: AuthUser): Promise<Response> {
+  const body = await bodyJson<{ token?: string }>(request);
+  const botToken = body.token?.trim() || "";
+  if (!/^\d{6,12}:[A-Za-z0-9_-]{30,}$/.test(botToken)) {
+    return problem(422, "صيغة توكن Telegram غير صحيحة.");
+  }
+  const meResponse = await telegramApi(botToken, "getMe");
+  const me = await meResponse.json() as { ok?: boolean; result?: { id?: number; username?: string; first_name?: string }; description?: string };
+  if (!meResponse.ok || !me.ok || !me.result?.id) {
+    return problem(422, `رفض Telegram التوكن: ${cleanText(me.description, 160) || "بيانات غير صالحة"}`);
+  }
+
+  const webhookSecret = randomSecret(32);
+  const webhookUrl = `${new URL(request.url).origin}/api/telegram/webhook`;
+  const webhookResponse = await telegramApi(botToken, "setWebhook", {
+    url: webhookUrl,
+    secret_token: webhookSecret,
+    allowed_updates: ["message", "callback_query"],
+    drop_pending_updates: false,
+  });
+  const webhookPayload = await webhookResponse.json() as { ok?: boolean; description?: string };
+  if (!webhookResponse.ok || !webhookPayload.ok) {
+    return problem(502, `تعذر تسجيل Webhook: ${cleanText(webhookPayload.description, 160) || "خطأ Telegram"}`);
+  }
+
+  const now = new Date().toISOString();
+  await upsertSecretSetting(env, user.id, "telegram_bot_token", botToken, now);
+  await upsertSecretSetting(env, user.id, "telegram_webhook_secret", webhookSecret, now);
+  await env.DB.prepare(
+    "INSERT INTO system_settings (id, owner_id, setting_key, value_json, created_at, updated_at) VALUES (?, ?, 'telegram_bot_profile', ?, ?, ?) ON CONFLICT(owner_id, setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+  ).bind(
+    crypto.randomUUID(),
+    user.id,
+    JSON.stringify({ id: me.result.id, username: me.result.username || null, first_name: me.result.first_name || null, webhook_url: webhookUrl }),
+    now,
+    now,
+  ).run();
+  await audit(env, user.id, "telegram.configure", "telegram_bot", String(me.result.id), { username: me.result.username || null });
+  return json({ ok: true, username: me.result.username || null, bot_id: me.result.id, webhook_url: webhookUrl });
+}
+
+async function telegramStatus(request: Request, env: Env, user: AuthUser): Promise<Response> {
+  const profile = await env.DB.prepare(
+    "SELECT value_json FROM system_settings WHERE owner_id = ? AND setting_key = 'telegram_bot_profile'",
+  ).bind(user.id).first<{ value_json: string | null }>();
+  const configured = await telegramConfigured(env, user.id);
+  if (!configured) return json({ configured: false, webhook_ok: false });
+  const tokenRow = await env.DB.prepare(
+    "SELECT encrypted_value FROM system_settings WHERE owner_id = ? AND setting_key = 'telegram_bot_token'",
+  ).bind(user.id).first<{ encrypted_value: string }>();
+  if (!tokenRow?.encrypted_value) return json({ configured: false, webhook_ok: false });
+  const botToken = await decryptSecret(tokenRow.encrypted_value, requiredKey(env));
+  const response = await telegramApi(botToken, "getWebhookInfo");
+  const payload = await response.json() as {
+    ok?: boolean;
+    result?: { url?: string; pending_update_count?: number; last_error_message?: string };
+  };
+  const saved = profile?.value_json ? JSON.parse(profile.value_json) as Record<string, unknown> : {};
+  const expectedUrl = `${new URL(request.url).origin}/api/telegram/webhook`;
+  return json({
+    configured: true,
+    username: saved.username || null,
+    webhook_ok: Boolean(payload.ok && payload.result?.url === expectedUrl),
+    pending_updates: payload.result?.pending_update_count || 0,
+    last_error: cleanText(payload.result?.last_error_message, 160) || null,
+  });
+}
+
+async function disconnectTelegram(env: Env, user: AuthUser): Promise<Response> {
+  const tokenRow = await env.DB.prepare(
+    "SELECT encrypted_value FROM system_settings WHERE owner_id = ? AND setting_key = 'telegram_bot_token'",
+  ).bind(user.id).first<{ encrypted_value: string }>();
+  if (tokenRow?.encrypted_value) {
+    const botToken = await decryptSecret(tokenRow.encrypted_value, requiredKey(env));
+    await telegramApi(botToken, "deleteWebhook", { drop_pending_updates: false });
+  }
+  await env.DB.prepare(
+    "DELETE FROM system_settings WHERE owner_id = ? AND setting_key IN ('telegram_bot_token', 'telegram_webhook_secret', 'telegram_bot_profile')",
+  ).bind(user.id).run();
+  await audit(env, user.id, "telegram.disconnect", "telegram_bot");
+  return json({ ok: true });
+}
+
+const allowedUploadTypes = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "application/json",
+]);
+
+async function uploadFile(request: Request, env: Env, user: AuthUser): Promise<Response> {
+  const contentType = request.headers.get("content-type") || "";
+  if (!contentType.startsWith("multipart/form-data")) return problem(415, "يجب رفع الملف بصيغة multipart/form-data.");
+  const form = await request.formData();
+  const item = form.get("file");
+  if (!(item instanceof File)) return problem(422, "لم يُرسل ملف.");
+  if (item.size <= 0 || item.size > 10 * 1024 * 1024) return problem(413, "حجم الملف يجب ألا يتجاوز 10 ميجابايت.");
+  if (!allowedUploadTypes.has(item.type)) return problem(415, "نوع الملف غير مسموح. الأنواع المدعومة: صور، PDF، TXT، Markdown، CSV وJSON.");
+
+  const id = crypto.randomUUID();
+  const safeName = sanitizeFileName(item.name);
+  const objectKey = `${user.id}/${id}/${safeName}`;
+  await env.BUCKET.put(objectKey, item.stream(), {
+    httpMetadata: { contentType: item.type },
+    customMetadata: { owner_id: user.id, file_id: id },
+  });
+  const now = new Date().toISOString();
+  try {
+    await env.DB.prepare(
+      "INSERT INTO stored_files (id, owner_id, object_key, file_name, content_type, size_bytes, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?)",
+    ).bind(id, user.id, objectKey, safeName, item.type, item.size, now, now).run();
+  } catch (error) {
+    await env.BUCKET.delete(objectKey);
+    throw error;
+  }
+  await audit(env, user.id, "file.upload", "stored_file", id, { content_type: item.type, size_bytes: item.size });
+  return json({
+    id,
+    file_name: safeName,
+    content_type: item.type,
+    size_bytes: item.size,
+    content_url: `/api/edge/files/${id}/content`,
+  }, 201);
+}
+
+async function downloadFile(id: string, env: Env, user: AuthUser): Promise<Response> {
+  const file = await ownedFile(id, env, user);
+  if (!file) return problem(404, "الملف غير موجود.");
+  const object = await env.BUCKET.get(file.object_key);
+  if (!object) return problem(404, "بيانات الملف غير موجودة في التخزين.");
+  return new Response(object.body, {
+    headers: {
+      "content-type": file.content_type,
+      "content-length": String(file.size_bytes),
+      "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(file.file_name)}`,
+      "cache-control": "private, no-store",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
+async function deleteFile(id: string, env: Env, user: AuthUser): Promise<Response> {
+  const file = await ownedFile(id, env, user);
+  if (!file) return problem(404, "الملف غير موجود.");
+  await env.BUCKET.delete(file.object_key);
+  await env.DB.prepare("UPDATE stored_files SET status = 'deleted', updated_at = ? WHERE id = ? AND owner_id = ?")
+    .bind(new Date().toISOString(), id, user.id).run();
+  await audit(env, user.id, "file.delete", "stored_file", id);
+  return json({ ok: true });
+}
+
+async function buildAttachmentContent(ids: string[], env: Env, user: AuthUser, messageId: string): Promise<Array<Record<string, unknown>>> {
+  const content: Array<Record<string, unknown>> = [];
+  for (const id of ids) {
+    const file = await ownedFile(id, env, user);
+    if (!file) throw new Error(`attachment_not_found:${id}`);
+    const object = await env.BUCKET.get(file.object_key);
+    if (!object) throw new Error(`attachment_bytes_missing:${id}`);
+    const createdAt = new Date().toISOString();
+    await env.DB.prepare(
+      "INSERT INTO message_attachments (id, message_id, file_id, kind, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).bind(crypto.randomUUID(), messageId, id, file.content_type.startsWith("image/") ? "image" : "file", createdAt).run();
+
+    if (file.content_type.startsWith("image/")) {
+      if (file.size_bytes > 5 * 1024 * 1024) throw new Error("image_too_large_for_model");
+      const bytes = new Uint8Array(await object.arrayBuffer());
+      content.push({
+        type: "image_url",
+        image_url: { url: `data:${file.content_type};base64,${toBase64(bytes)}` },
+      });
+      continue;
+    }
+    if (["text/plain", "text/markdown", "text/csv", "application/json"].includes(file.content_type)) {
+      const textBody = (await object.text()).slice(0, 60000);
+      content.push({ type: "text", text: `محتوى الملف ${file.file_name}:\n${textBody}` });
+      continue;
+    }
+    content.push({ type: "text", text: `أُرفق ملف باسم ${file.file_name} من النوع ${file.content_type}.` });
+  }
+  return content;
+}
+
+async function ownedFile(id: string, env: Env, user: AuthUser) {
+  return env.DB.prepare(
+    "SELECT id, object_key, file_name, content_type, size_bytes FROM stored_files WHERE id = ? AND owner_id = ? AND status = 'ready'",
+  ).bind(id, user.id).first<{
+    id: string;
+    object_key: string;
+    file_name: string;
+    content_type: string;
+    size_bytes: number;
+  }>();
+}
+
+async function loadTelegramCredentials(env: Env): Promise<{ botToken: string; webhookSecret: string } | null> {
+  const rows = await env.DB.prepare(
+    "SELECT setting_key, encrypted_value FROM system_settings WHERE owner_id = (SELECT owner_id FROM system_settings WHERE setting_key = 'telegram_bot_token' ORDER BY updated_at DESC LIMIT 1) AND setting_key IN ('telegram_bot_token', 'telegram_webhook_secret') AND encrypted_value IS NOT NULL",
+  ).all<{ setting_key: string; encrypted_value: string }>();
+  const values = new Map(rows.results.map((row) => [row.setting_key, row.encrypted_value]));
+  const token = values.get("telegram_bot_token");
+  const secret = values.get("telegram_webhook_secret");
+  if (!token || !secret) return null;
+  const master = requiredKey(env);
+  return {
+    botToken: await decryptSecret(token, master),
+    webhookSecret: await decryptSecret(secret, master),
+  };
+}
+
+async function telegramConfigured(env: Env, ownerId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS value FROM system_settings WHERE owner_id = ? AND setting_key IN ('telegram_bot_token', 'telegram_webhook_secret') AND encrypted_value IS NOT NULL",
+  ).bind(ownerId).first<{ value: number }>();
+  return Number(row?.value || 0) === 2;
+}
+
+async function upsertSecretSetting(env: Env, ownerId: string, settingKey: string, value: string, now: string) {
+  const encrypted = await encryptSecret(value, requiredKey(env));
+  await env.DB.prepare(
+    "INSERT INTO system_settings (id, owner_id, setting_key, encrypted_value, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(owner_id, setting_key) DO UPDATE SET encrypted_value = excluded.encrypted_value, value_json = NULL, updated_at = excluded.updated_at",
+  ).bind(crypto.randomUUID(), ownerId, settingKey, encrypted, now, now).run();
+}
+
+async function telegramApi(token: string, method: string, payload?: Record<string, unknown>): Promise<Response> {
+  return fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: payload ? "POST" : "GET",
+    headers: payload ? { "content-type": "application/json" } : undefined,
+    body: payload ? JSON.stringify(payload) : undefined,
+    signal: AbortSignal.timeout(15000),
+  });
 }
 
 async function ownedProvider(id: string, env: Env, user: AuthUser) {
@@ -271,7 +595,7 @@ async function count(env: Env, table: "users") {
   return Number(row?.value || 0);
 }
 
-async function countOwned(env: Env, table: "conversations" | "background_jobs" | "ai_providers", ownerId: string) {
+async function countOwned(env: Env, table: "conversations" | "background_jobs" | "ai_providers" | "stored_files", ownerId: string) {
   const row = await env.DB.prepare(`SELECT COUNT(*) AS value FROM ${table} WHERE owner_id = ?`).bind(ownerId).first<{ value: number }>();
   return Number(row?.value || 0);
 }
@@ -282,20 +606,74 @@ async function bodyJson<T>(request: Request): Promise<T> {
   return request.json<T>();
 }
 
-function validateExternalHttpsUrl(value?: string): string | null {
+function normalizeProviderBaseUrl(value?: string): string | null {
   if (!value) return null;
   try {
     const url = new URL(value);
     const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
     if (url.protocol !== "https:" || url.username || url.password || url.port && url.port !== "443") return null;
     if (host === "localhost" || host.endsWith(".local") || host === "169.254.169.254" || isPrivateIp(host)) return null;
-    url.pathname = url.pathname.replace(/\/+$/, "");
+    url.pathname = url.pathname
+      .replace(/\/(chat\/completions|completions|models)\/?$/i, "")
+      .replace(/\/+$/, "");
+    if (!url.pathname || url.pathname === "/") url.pathname = "/v1";
     url.search = "";
     url.hash = "";
     return url.toString().replace(/\/$/, "");
   } catch {
     return null;
   }
+}
+
+function providerHeaders(key: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${key}`,
+    accept: "application/json",
+    "user-agent": "MidadAI/1.0",
+  };
+}
+
+function extractModelIds(payload: unknown): string[] {
+  if (Array.isArray(payload)) {
+    return payload.map((item) => typeof item === "string" ? item : isRecord(item) ? String(item.id || item.name || "") : "").filter(Boolean);
+  }
+  if (!isRecord(payload)) return [];
+  const list = Array.isArray(payload.data)
+    ? payload.data
+    : Array.isArray(payload.models)
+      ? payload.models
+      : Array.isArray(payload.result)
+        ? payload.result
+        : [];
+  return list
+    .map((item) => typeof item === "string" ? item : isRecord(item) ? String(item.id || item.name || item.model || "") : "")
+    .filter(Boolean);
+}
+
+function normalizeAssistantContent(value: string | Array<{ type?: string; text?: string }> | undefined): string {
+  if (typeof value === "string") return value.trim();
+  if (!Array.isArray(value)) return "";
+  return value.map((part) => typeof part.text === "string" ? part.text : "").filter(Boolean).join("\n").trim();
+}
+
+async function safeUpstreamError(response: Response): Promise<string> {
+  try {
+    const payload = await response.json() as unknown;
+    if (isRecord(payload)) {
+      const error = payload.error;
+      if (typeof error === "string") return cleanText(error, 180);
+      if (isRecord(error) && typeof error.message === "string") return cleanText(error.message, 180);
+      if (typeof payload.message === "string") return cleanText(payload.message, 180);
+      if (typeof payload.detail === "string") return cleanText(payload.detail, 180);
+    }
+  } catch {
+    return `HTTP ${response.status}`;
+  }
+  return `HTTP ${response.status}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function isPrivateIp(host: string): boolean {
@@ -331,7 +709,12 @@ function requiredKey(env: Env): string {
 }
 
 function toBase64(value: Uint8Array): string {
-  return btoa(String.fromCharCode(...value));
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < value.length; offset += chunkSize) {
+    binary += String.fromCharCode(...value.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
 }
 
 function fromBase64(value: string): Uint8Array {
@@ -340,6 +723,16 @@ function fromBase64(value: string): Uint8Array {
 
 function cleanText(value: unknown, max: number): string {
   return typeof value === "string" ? value.replace(/\u0000/g, "").trim().slice(0, max) : "";
+}
+
+function sanitizeFileName(value: string): string {
+  const normalized = value.normalize("NFKC").replace(/[\/\\\u0000-\u001f\u007f]+/g, "_").trim();
+  return (normalized || "file").slice(0, 120);
+}
+
+function randomSecret(length: number): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function safeDecode(value: string): string | null {
