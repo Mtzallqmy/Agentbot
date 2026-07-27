@@ -6,9 +6,8 @@ import { handleEdgeApi } from "./edge-api";
 interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
+  BUCKET: R2Bucket;
   ENCRYPTION_MASTER_KEY?: string;
-  TELEGRAM_BOT_TOKEN?: string;
-  TELEGRAM_WEBHOOK_SECRET?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
