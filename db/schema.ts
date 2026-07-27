@@ -61,6 +61,38 @@ export const messages = sqliteTable("messages", {
   ...timestamps,
 });
 
+export const storedFiles = sqliteTable("stored_files", {
+  id: text("id").primaryKey(),
+  ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  objectKey: text("object_key").notNull().unique(),
+  fileName: text("file_name").notNull(),
+  contentType: text("content_type").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  status: text("status").notNull().default("ready"),
+  ...timestamps,
+});
+
+export const messageAttachments = sqliteTable("message_attachments", {
+  id: text("id").primaryKey(),
+  messageId: text("message_id").notNull().references(() => messages.id, { onDelete: "cascade" }),
+  fileId: text("file_id").notNull().references(() => storedFiles.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull().default("file"),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("message_attachments_message_file_idx").on(table.messageId, table.fileId),
+]);
+
+export const systemSettings = sqliteTable("system_settings", {
+  id: text("id").primaryKey(),
+  ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  settingKey: text("setting_key").notNull(),
+  encryptedValue: text("encrypted_value"),
+  valueJson: text("value_json"),
+  ...timestamps,
+}, (table) => [
+  uniqueIndex("system_settings_owner_key_idx").on(table.ownerId, table.settingKey),
+]);
+
 export const agentProjects = sqliteTable("agent_projects", {
   id: text("id").primaryKey(),
   ownerId: text("owner_id").notNull().references(() => users.id, { onDelete: "cascade" }),
