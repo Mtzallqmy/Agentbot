@@ -2,7 +2,8 @@
 
 منصة عربية متعددة الواجهات تجمع دردشة AI قابلة لتوسعة المزودين، بوت Telegram
 عبر Webhook، مهام وسائط معزولة، وAgent Workspace بصلاحيات وموافقات. التصميم
-Modular Monolith في FastAPI مع Worker مستقل وواجهة Vinext/Next داعمة لـRTL.
+Modular Monolith في FastAPI مع Worker مستقل، إضافة إلى نشر Sites يعمل بـEdge
+API وD1 وواجهة Vinext/Next داعمة لـRTL.
 
 > حالة المشروع: تنفيذ MVP جارٍ على مراحل. لا تعمل التكاملات الخارجية حتى تضبط
 > بيانات اعتمادها. لا توجد مفاتيح افتراضية، ولا يدّعي المشروع دعم مصدر وسائط أو
@@ -109,13 +110,17 @@ python -m platform_bot.polling
 تقرأ الخدمة `HTTPS_PROXY` تلقائياً عند وجود شبكة مقيدة. لا تحفظ
 `TELEGRAM_BOT_TOKEN` داخل Git؛ ضعه في `.env` المحلي أو Secret Manager فقط.
 
-## استكشاف خطأ «الخادم غير متصل»
+## نسخة Sites الدائمة
 
-حقل `رابط Backend` يقبل رابط HTTPS كاملاً لخدمة FastAPI، مثل
-`https://api.example.com`. لا تكتب فيه `Ok` أو البريد أو اسم البوت. عند تشغيل
-Docker Compose خلف Nginx اترك `NEXT_PUBLIC_API_BASE_URL` فارغاً لأن الواجهة
-والـAPI يستخدمان النطاق نفسه. نسخة Sites تحتاج Backend خارجياً منشوراً؛ Sites
-لا تشغّل حاوية Python/ARQ.
+نسخة Sites لا تطلب عنوان Backend من المتصفح ولا تستخدم CORS: الواجهة وواجهات
+`/api/edge/*` تعملان من النطاق نفسه، والمصادقة تتم بواسطة هوية Sites. تُخزن
+المحادثات والمزودات والمشروعات وسجل التدقيق في D1، وتُشفّر مفاتيح المزودات
+بـAES-GCM باستخدام سر إنتاج لا يدخل المستودع.
+
+مسار Telegram هو `/api/telegram/webhook` ويتحقق من
+`X-Telegram-Bot-Api-Secret-Token` ويمنع تكرار `update_id`. لا يُفعّل إلا بعد
+ضبط توكن جديد غير مكشوف وسر Webhook في بيئة Sites. تبقى FFmpeg وyt-dlp
+وSandbox داخل Worker حاويات دائم لأن Edge runtime لا يشغّل هذه البرامج.
 
 ## إنشاء أول Admin
 
