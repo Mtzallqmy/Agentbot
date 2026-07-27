@@ -15,8 +15,7 @@ const nav: Array<{ id: View; icon: string; label: string; hint: string }> = [
   { id: "settings", icon: "⚙", label: "الإعدادات", hint: "الاتصال والواجهة" },
 ];
 
-const initialApi =
-  process.env.NEXT_PUBLIC_API_BASE_URL || "";
+const internalApi = "";
 
 async function request<T>(
   apiBase: string,
@@ -39,28 +38,17 @@ async function request<T>(
 export default function Dashboard() {
   const [view, setView] = useState<View>("chat");
   const [mobileNav, setMobileNav] = useState(false);
-  const [apiBase, setApiBase] = useState(initialApi);
+  const apiBase = internalApi;
   const [online, setOnline] = useState<boolean | null>(null);
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
 
-  useEffect(() => {
-    const saved = window.localStorage.getItem("ai-platform-api-base");
-    if (saved && /^https?:\/\/[^/\s]+/i.test(saved)) {
-      // Restoring a device-local preference is the intended external sync here.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setApiBase(saved.replace(/\/$/, ""));
-    } else if (saved) {
-      window.localStorage.removeItem("ai-platform-api-base");
-    }
-  }, []);
-
   const checkHealth = useCallback(async () => {
     try {
-      await request(apiBase, "/health");
+      await request(apiBase, "/api/edge/health");
       setOnline(true);
       try {
-        await request(apiBase, "/api/v1/auth/me");
+        await request(apiBase, "/api/edge/me");
         setAuthenticated(true);
       } catch {
         setAuthenticated(false);
@@ -85,13 +73,7 @@ export default function Dashboard() {
 
   if (!authenticated) {
     return (
-      <Login
-        apiBase={apiBase}
-        setApiBase={setApiBase}
-        online={online}
-        checking={authenticated === null}
-        onLogin={() => setAuthenticated(true)}
-      />
+      <Login online={online} checking={authenticated === null} />
     );
   }
 
@@ -136,8 +118,7 @@ export default function Dashboard() {
           <div className="top-actions">
             <button className="quiet-button" onClick={() => void checkHealth()}>تحديث الحالة</button>
             <button className="quiet-button" onClick={async () => {
-              await request(apiBase, "/api/v1/auth/logout", { method: "POST" }).catch(() => undefined);
-              setAuthenticated(false);
+              window.location.assign("/signout-with-chatgpt?return_to=/");
             }}>خروج</button>
             <span className="avatar">م</span>
           </div>
@@ -151,16 +132,7 @@ export default function Dashboard() {
           {view === "media" && <Media apiBase={apiBase} setNotice={setNotice} />}
           {view === "providers" && <Providers apiBase={apiBase} setNotice={setNotice} />}
           {view === "admin" && <Admin apiBase={apiBase} online={online} setNotice={setNotice} />}
-          {view === "settings" && (
-            <Settings
-              apiBase={apiBase}
-              setApiBase={setApiBase}
-              onSave={(value) => {
-                window.localStorage.setItem("ai-platform-api-base", value);
-                setNotice({ tone: "ok", text: "حُفظ عنوان الـAPI على هذا الجهاز." });
-              }}
-            />
-          )}
+          {view === "settings" && <Settings />}
         </div>
       </section>
     </main>
@@ -192,13 +164,13 @@ function Chat({ apiBase, online, setNotice }: { apiBase: string; online: boolean
     try {
       let id = conversationId;
       if (!id) {
-        const conversation = await request<{ id: string }>(apiBase, "/api/v1/conversations", {
+        const conversation = await request<{ id: string }>(apiBase, "/api/edge/conversations", {
           method: "POST", body: JSON.stringify({ title: content.slice(0, 70) }),
         });
         id = conversation.id;
         setConversationId(id);
       }
-      const response = await fetch(`${apiBase.replace(/\/$/, "")}/api/v1/conversations/${id}/messages`, {
+      const response = await fetch(`${apiBase.replace(/\/$/, "")}/api/edge/conversations/${id}/messages`, {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
@@ -279,73 +251,10 @@ function Chat({ apiBase, online, setNotice }: { apiBase: string; online: boolean
   );
 }
 
-function Login({ apiBase, setApiBase, online, checking, onLogin }: {
-  apiBase: string;
-  setApiBase: (value: string) => void;
+function Login({ online, checking }: {
   online: boolean | null;
   checking: boolean;
-  onLogin: () => void;
 }) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    const normalizedApi = apiBase.trim().replace(/\/$/, "");
-    setError("");
-    if (!email.trim() || !password) {
-      setError("أدخل بريد المالك وكلمة المرور أولاً.");
-      return;
-    }
-    let parsedApi: URL | null = null;
-    if (normalizedApi) {
-      try {
-        parsedApi = new URL(normalizedApi);
-      } catch {
-        setError("عنوان الخادم غير صالح. استخدم رابطاً كاملاً مثل https://api.example.com");
-        return;
-      }
-      if (!["http:", "https:"].includes(parsedApi.protocol) || parsedApi.username || parsedApi.password) {
-        setError("عنوان الخادم غير صالح. استخدم رابط HTTP(S) من دون بيانات دخول داخله.");
-        return;
-      }
-    }
-    if (window.location.protocol === "https:" && parsedApi?.protocol === "http:") {
-      setError("يجب أن يستخدم الخادم HTTPS لأن الواجهة منشورة باتصال آمن.");
-      return;
-    }
-    if (parsedApi?.origin === window.location.origin) {
-      setError(
-        "هذا رابط واجهة الويب، وليس Backend. يلزم رابط HTTPS منفصل لخدمة FastAPI المنشورة.",
-      );
-      return;
-    }
-    if (!normalizedApi && window.location.hostname.endsWith(".chatgpt.site")) {
-      setError("Backend غير منشور بعد. لا تكتب كلمة مثل Ok؛ يلزم رابط HTTPS لخدمة FastAPI.");
-      return;
-    }
-    setBusy(true);
-    setApiBase(normalizedApi);
-    if (normalizedApi) window.localStorage.setItem("ai-platform-api-base", normalizedApi);
-    try {
-      await request(normalizedApi, "/api/v1/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ email, password }),
-      });
-      setPassword("");
-      onLogin();
-    } catch (loginError) {
-      const message = loginError instanceof Error ? loginError.message : "";
-      if (message.includes("401")) {
-        setError("البريد الإلكتروني أو كلمة المرور غير صحيحة.");
-      } else if (message.includes("503")) {
-        setError("خدمة الدخول لم تُهيأ بأسرار المالك بعد.");
-      } else {
-        setError("تعذر الوصول إلى Backend. تحقق من رابط HTTPS وأن CORS يسمح بهذا النطاق.");
-      }
-    } finally { setBusy(false); }
-  }
   return (
     <main dir="rtl" className="login-page">
       <section className="login-brand">
@@ -359,28 +268,14 @@ function Login({ apiBase, setApiBase, online, checking, onLogin }: {
         </ul>
       </section>
       <section className="login-panel">
-        <form onSubmit={submit} noValidate>
+        <div className="site-login-card">
           <div className="login-lock">⌁</div>
-          <span className={`login-status ${online ? "ready" : ""}`}>{checking ? "جارٍ التحقق من الجلسة" : online ? "اتصال آمن بالخادم" : "الخادم غير متصل"}</span>
+          <span className={`login-status ${online ? "ready" : ""}`}>{checking ? "جارٍ التحقق من الجلسة" : online ? "Edge API متصل" : "يلزم تسجيل الدخول"}</span>
           <h2>دخول المالك</h2>
-          <p>هذه المساحة خاصة بمالك المنصة. كل محاولة دخول تُسجل لأغراض الأمان.</p>
-          <label>البريد الإلكتروني<input required type="email" autoComplete="username" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="owner@example.com" /></label>
-          <label>كلمة المرور<input required type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
-          <label>رابط Backend
-            <input
-              dir="ltr"
-              type="url"
-              inputMode="url"
-              value={apiBase}
-              onChange={(e) => setApiBase(e.target.value)}
-              placeholder="https://api.example.com"
-            />
-            <small className="field-help">يجب أن يكون رابط خدمة FastAPI المنشورة، وليس كلمة أو اسم مستخدم.</small>
-          </label>
-          {error && <div className="login-error">{error}</div>}
-          <button className="primary-button" disabled={busy}>{busy ? "جارٍ التحقق…" : "دخول آمن"}</button>
-          <small className="login-foot">الجلسة قصيرة العمر ومحفوظة في Cookie لا يستطيع JavaScript قراءتها.</small>
-        </form>
+          <p>المصادقة تتم عبر Sites، ولا تُرسل كلمة مرور المالك إلى JavaScript أو إلى Backend خارجي.</p>
+          <a className="primary-button" href="/signin-with-chatgpt?return_to=/">دخول آمن عبر المنصة</a>
+          <small className="login-foot">الوصول مقيّد بقائمة مستخدمي الموقع، وتُسجل العمليات الحساسة في قاعدة البيانات.</small>
+        </div>
       </section>
     </main>
   );
@@ -390,7 +285,7 @@ function Providers({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Not
   const [form, setForm] = useState({ name: "", base_url: "https://api.openai.com/v1", api_key: "", compatibility: "openai" });
   const [providers, setProviders] = useState<Array<{ id: string; name: string; base_url: string; key_hint?: string }>>([]);
   const load = useCallback(async () => {
-    try { setProviders(await request(apiBase, "/api/v1/providers")); } catch { setProviders([]); }
+    try { setProviders(await request(apiBase, "/api/edge/providers")); } catch { setProviders([]); }
   }, [apiBase]);
   // Provider records are owned by the API rather than component state.
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -398,14 +293,14 @@ function Providers({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Not
   async function submit(event: FormEvent) {
     event.preventDefault();
     try {
-      await request(apiBase, "/api/v1/providers", { method: "POST", body: JSON.stringify(form) });
+      await request(apiBase, "/api/edge/providers", { method: "POST", body: JSON.stringify(form) });
       setForm({ ...form, name: "", api_key: "" }); await load();
       setNotice({ tone: "ok", text: "حُفظ المزود ومفتاحه مشفراً." });
     } catch (error) { setNotice({ tone: "error", text: `تعذر حفظ المزود: ${String(error)}` }); }
   }
   async function test(id: string) {
     try {
-      const result = await request<{ ok: boolean; models_count?: number }>(apiBase, `/api/v1/providers/${id}/test`, { method: "POST" });
+      const result = await request<{ ok: boolean; models_count?: number }>(apiBase, `/api/edge/providers/${id}/test`, { method: "POST" });
       setNotice({ tone: result.ok ? "ok" : "error", text: result.ok ? `نجح الاتصال${result.models_count !== undefined ? ` — ${result.models_count} نموذجاً` : ""}.` : "فشل اختبار المزود." });
     } catch (error) { setNotice({ tone: "error", text: `فشل الاختبار: ${String(error)}` }); }
   }
@@ -442,11 +337,11 @@ function Media({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice)
   async function analyze(event: FormEvent) {
     event.preventDefault();
     try {
-      const queued = await request<{ id: string }>(apiBase, "/api/v1/media/analyze", { method: "POST", body: JSON.stringify({ url }) });
+      const queued = await request<{ id: string }>(apiBase, "/api/edge/media/analyze", { method: "POST", body: JSON.stringify({ url }) });
       setNotice({ tone: "info", text: "بدأ تحليل المصدر. ستظهر الصيغ عند اكتماله." });
       for (let attempt = 0; attempt < 30; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        const job = await request<{ status: string; result?: typeof analysis; error_code?: string }>(apiBase, `/api/v1/jobs/${queued.id}`);
+        const job = await request<{ status: string; result?: typeof analysis; error_code?: string }>(apiBase, `/api/edge/jobs/${queued.id}`);
         if (job.status === "completed" && job.result) {
           setAnalysis(job.result);
           setFormat("mp4");
@@ -460,7 +355,7 @@ function Media({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice)
   }
   async function createJob() {
     try {
-      const job = await request<{ id: string }>(apiBase, "/api/v1/media/jobs", { method: "POST", body: JSON.stringify({
+      const job = await request<{ id: string }>(apiBase, "/api/edge/media/jobs", { method: "POST", body: JSON.stringify({
         url,
         mode: "video",
         format: ["mp4", "webm", "mp3", "m4a", "wav", "ogg"].includes(format) ? format : "mp4",
@@ -471,7 +366,7 @@ function Media({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice)
       setNotice({ tone: "ok", text: `أُضيفت المهمة إلى الطابور: ${job.id}` });
       for (let attempt = 0; attempt < 300; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
-        const state = await request<{ id: string; status: string; progress: number }>(apiBase, `/api/v1/jobs/${job.id}`);
+        const state = await request<{ id: string; status: string; progress: number }>(apiBase, `/api/edge/jobs/${job.id}`);
         setJob(state);
         if (["completed", "failed", "cancelled"].includes(state.status)) return;
       }
@@ -479,7 +374,7 @@ function Media({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice)
   }
   async function cancelJob() {
     if (!job) return;
-    const state = await request<{ id: string; status: string; progress: number }>(apiBase, `/api/v1/jobs/${job.id}/cancel`, { method: "POST" });
+    const state = await request<{ id: string; status: string; progress: number }>(apiBase, `/api/edge/jobs/${job.id}/cancel`, { method: "POST" });
     setJob(state);
   }
   return (
@@ -488,7 +383,7 @@ function Media({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice)
       <form className="url-bar" onSubmit={analyze}><input dir="ltr" type="url" required value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/video" /><button>تحليل الرابط</button></form>
       <div className="card legal"><b>تنبيه الاستخدام المسؤول</b><p>استخدم الأداة فقط للمحتوى الذي تملك حق تنزيله ومعالجته. لا يدعم النظام DRM أو المحتوى الخاص أو المدفوع.</p></div>
       {analysis && <section className="card media-result"><div className="media-thumb">▶</div><div><span>تم التحليل</span><h2>{analysis.title}</h2><p>{analysis.duration ? `${Math.round(analysis.duration / 60)} دقيقة` : "المدة غير متاحة"}</p><label>الجودة المتاحة<select value={format} onChange={(e) => setFormat(e.target.value)}><option value="mp4">أفضل فيديو MP4</option>{analysis.formats?.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label><button className="primary-button" onClick={() => void createJob()}>بدء المعالجة</button></div></section>}
-      {job && <section className="card job-progress"><div><b>حالة المهمة: {job.status}</b><span>{job.progress}%</span></div><div className="meter"><i style={{ width: `${job.progress}%` }} /></div>{job.status === "completed" ? <a className="primary-button" href={`${apiBase.replace(/\/$/, "")}/api/v1/jobs/${job.id}/download`}>تنزيل النتيجة</a> : !["failed", "cancelled"].includes(job.status) ? <button className="secondary-button" onClick={() => void cancelJob()}>إلغاء المهمة</button> : null}</section>}
+      {job && <section className="card job-progress"><div><b>حالة المهمة: {job.status}</b><span>{job.progress}%</span></div><div className="meter"><i style={{ width: `${job.progress}%` }} /></div>{job.status === "completed" ? <a className="primary-button" href={`${apiBase.replace(/\/$/, "")}/api/edge/jobs/${job.id}/download`}>تنزيل النتيجة</a> : !["failed", "cancelled"].includes(job.status) ? <button className="secondary-button" onClick={() => void cancelJob()}>إلغاء المهمة</button> : null}</section>}
     </>
   );
 }
@@ -500,14 +395,14 @@ function Agent({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice)
   async function create(event: FormEvent) {
     event.preventDefault();
     try {
-      const project = await request<{ id: string }>(apiBase, "/api/v1/agent/projects", { method: "POST", body: JSON.stringify({ name }) });
+      const project = await request<{ id: string }>(apiBase, "/api/edge/agent/projects", { method: "POST", body: JSON.stringify({ name }) });
       setProjectId(project.id); setNotice({ tone: "ok", text: "أُنشئ المشروع بمساحة عمل معزولة." });
     } catch (error) { setNotice({ tone: "error", text: `تعذر إنشاء المشروع: ${String(error)}` }); }
   }
   async function run() {
     if (!projectId) return;
     try {
-      const result = await request<{ id: string; status: string }>(apiBase, `/api/v1/agent/projects/${projectId}/runs`, { method: "POST", body: JSON.stringify({ instruction }) });
+      const result = await request<{ id: string; status: string }>(apiBase, `/api/edge/agent/projects/${projectId}/runs`, { method: "POST", body: JSON.stringify({ instruction }) });
       setNotice({ tone: "info", text: `بدأ التشغيل ${result.id} بحالة ${result.status}. العمليات الحساسة ستنتظر موافقة صريحة.` });
     } catch (error) { setNotice({ tone: "error", text: `تعذر بدء الوكيل: ${String(error)}` }); }
   }
@@ -526,7 +421,7 @@ function Agent({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice)
 function Admin({ apiBase, online, setNotice }: { apiBase: string; online: boolean | null; setNotice: (n: Notice) => void }) {
   const [metrics, setMetrics] = useState<Record<string, number> | null>(null);
   const load = useCallback(async () => {
-    try { setMetrics(await request(apiBase, "/api/v1/admin/metrics")); }
+    try { setMetrics(await request(apiBase, "/api/edge/admin/metrics")); }
     catch (error) { setMetrics(null); if (online) setNotice({ tone: "error", text: `تعذر تحميل المؤشرات: ${String(error)}` }); }
   }, [apiBase, online, setNotice]);
   // Metrics are fetched from the live system of record.
@@ -547,11 +442,11 @@ function Admin({ apiBase, online, setNotice }: { apiBase: string; online: boolea
   );
 }
 
-function Settings({ apiBase, setApiBase, onSave }: { apiBase: string; setApiBase: (v: string) => void; onSave: (v: string) => void }) {
+function Settings() {
   return (
     <>
-      <SectionHeading eyebrow="تهيئة البيئة" title="الإعدادات" copy="حدّد عنوان الـBackend المنشور. يحفظ المتصفح هذا العنوان كتفضيل محلي فقط." />
-      <section className="card settings-card"><label>API Base URL<input dir="ltr" value={apiBase} onChange={(e) => setApiBase(e.target.value)} /></label><button className="primary-button" onClick={() => onSave(apiBase)}>حفظ وإعادة الاتصال</button><div className="security-note"><b>إعداد الإنتاج</b><p>استخدم HTTPS واضبط NEXT_PUBLIC_API_BASE_URL وقت البناء، واسمح لنطاق الواجهة في CORS على الخادم.</p></div></section>
+      <SectionHeading eyebrow="تهيئة البيئة" title="الإعدادات" copy="الواجهة وEdge API يعملان الآن من النطاق نفسه، لذلك لا يلزم عنوان Backend أو إعداد CORS في المتصفح." />
+      <section className="card settings-card"><div className="security-note"><b>اتصال Same-Origin</b><p>المصادقة وقاعدة البيانات وواجهات المزودات تعمل داخل Sites. وظائف FFmpeg وSandbox ستتصل لاحقاً بWorker حاويات مخصص عبر قناة خادم آمنة.</p></div></section>
     </>
   );
 }
