@@ -118,9 +118,15 @@ python -m platform_bot.polling
 بـAES-GCM باستخدام سر إنتاج لا يدخل المستودع.
 
 مسار Telegram هو `/api/telegram/webhook` ويتحقق من
-`X-Telegram-Bot-Api-Secret-Token` ويمنع تكرار `update_id`. لا يُفعّل إلا بعد
-ضبط توكن جديد غير مكشوف وسر Webhook في بيئة Sites. تبقى FFmpeg وyt-dlp
-وSandbox داخل Worker حاويات دائم لأن Edge runtime لا يشغّل هذه البرامج.
+`X-Telegram-Bot-Api-Secret-Token` ويمنع تكرار `update_id`. يُدخل المالك التوكن
+الجديد من شاشة «الإعدادات والتخزين»؛ يتحقق الخادم منه عبر `getMe`، ويسجل
+Webhook تلقائياً، ثم يخزن التوكن والسر مشفرين من دون إعادتهما للمتصفح.
+
+تُخزن الصور والملفات في R2 وبيانات ملكيتها ومرفقات الرسائل في D1. تدعم
+المحادثة صور JPEG/PNG/WebP/GIF وملفات PDF والنصوص وMarkdown وCSV وJSON حتى
+10MB للملف. الصور تُرسل للنماذج المتوافقة مع Vision كـdata URL، والملفات
+النصية تدخل في سياق الطلب. تبقى FFmpeg وyt-dlp وSandbox داخل Worker حاويات
+دائم لأن Edge runtime لا يشغّل هذه البرامج.
 
 ## إنشاء أول Admin
 
