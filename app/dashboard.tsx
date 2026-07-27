@@ -4,7 +4,9 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 type View = "chat" | "agent" | "media" | "providers" | "admin" | "settings";
 type Notice = { tone: "ok" | "error" | "info"; text: string } | null;
-type ChatMessage = { role: "user" | "assistant"; content: string };
+type UploadedFile = { id: string; file_name: string; content_type: string; size_bytes: number; content_url?: string };
+type ProviderSummary = { id: string; name: string; base_url: string; key_hint?: string; default_model?: string | null };
+type ChatMessage = { role: "user" | "assistant"; content: string; attachments?: UploadedFile[] };
 
 const nav: Array<{ id: View; icon: string; label: string; hint: string }> = [
   { id: "chat", icon: "✦", label: "الدردشة الذكية", hint: "محادثة متعددة النماذج" },
@@ -132,7 +134,7 @@ export default function Dashboard() {
           {view === "media" && <Media apiBase={apiBase} setNotice={setNotice} />}
           {view === "providers" && <Providers apiBase={apiBase} setNotice={setNotice} />}
           {view === "admin" && <Admin apiBase={apiBase} online={online} setNotice={setNotice} />}
-          {view === "settings" && <Settings />}
+          {view === "settings" && <Settings apiBase={apiBase} setNotice={setNotice} />}
         </div>
       </section>
     </main>
@@ -153,19 +155,68 @@ function Chat({ apiBase, online, setNotice }: { apiBase: string; online: boolean
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<UploadedFile[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [providers, setProviders] = useState<ProviderSummary[]>([]);
+  const [providerId, setProviderId] = useState("");
+  const [modelId, setModelId] = useState("");
+
+  useEffect(() => {
+    void request<ProviderSummary[]>(apiBase, "/api/edge/providers")
+      .then((items) => {
+        setProviders(items);
+        if (items[0]) {
+          setProviderId(items[0].id);
+          setModelId(items[0].default_model || "");
+        }
+      })
+      .catch(() => setProviders([]));
+  }, [apiBase]);
+
+  async function uploadFiles(files: FileList | null) {
+    if (!files?.length) return;
+    setUploading(true);
+    try {
+      const added: UploadedFile[] = [];
+      for (const file of Array.from(files).slice(0, 8 - attachments.length)) {
+        const form = new FormData();
+        form.append("file", file);
+        const response = await fetch("/api/edge/files", {
+          method: "POST",
+          credentials: "include",
+          body: form,
+          signal: AbortSignal.timeout(30000),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        added.push(await response.json() as UploadedFile);
+      }
+      setAttachments((items) => [...items, ...added].slice(0, 8));
+      setNotice({ tone: "ok", text: `تم رفع ${added.length} مرفق إلى التخزين الخاص.` });
+    } catch (error) {
+      setNotice({ tone: "error", text: `تعذر رفع الملف: ${String(error)}` });
+    } finally {
+      setUploading(false);
+    }
+  }
 
   async function send(event: FormEvent) {
     event.preventDefault();
     const content = input.trim();
-    if (!content || busy) return;
-    setMessages((items) => [...items, { role: "user", content }]);
+    if ((!content && attachments.length === 0) || busy) return;
+    const sentAttachments = attachments;
+    setMessages((items) => [...items, { role: "user", content: content || "مرفقات", attachments: sentAttachments }]);
     setInput("");
+    setAttachments([]);
     setBusy(true);
     try {
       let id = conversationId;
       if (!id) {
         const conversation = await request<{ id: string }>(apiBase, "/api/edge/conversations", {
-          method: "POST", body: JSON.stringify({ title: content.slice(0, 70) }),
+          method: "POST", body: JSON.stringify({
+            title: (content || sentAttachments[0]?.file_name || "محادثة جديدة").slice(0, 70),
+            provider_id: providerId || undefined,
+            model_id: modelId || undefined,
+          }),
         });
         id = conversation.id;
         setConversationId(id);
@@ -174,7 +225,12 @@ function Chat({ apiBase, online, setNotice }: { apiBase: string; online: boolean
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({
+          content,
+          attachment_ids: sentAttachments.map((file) => file.id),
+          provider_id: providerId || undefined,
+          model_id: modelId || undefined,
+        }),
       });
       if (!response.ok) throw new Error(await response.text());
       const type = response.headers.get("content-type") || "";
@@ -232,6 +288,11 @@ function Chat({ apiBase, online, setNotice }: { apiBase: string; online: boolean
             <article key={index} className={`message ${message.role}`}>
               <b>{message.role === "user" ? "أنت" : "المساعد"}</b>
               <p>{message.content || "…"}</p>
+              {message.attachments?.length ? <div className="message-files">{message.attachments.map((file) => (
+                <a key={file.id} href={`/api/edge/files/${file.id}/content`} target="_blank" rel="noreferrer">
+                  {file.content_type.startsWith("image/") ? "🖼" : "📎"} {file.file_name}
+                </a>
+              ))}</div> : null}
             </article>
           ))}
         </div>
@@ -239,12 +300,28 @@ function Chat({ apiBase, online, setNotice }: { apiBase: string; online: boolean
           <textarea value={input} onChange={(e) => setInput(e.target.value)} placeholder="اكتب رسالتك… (Enter للإرسال)" onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); }
           }} />
-          <div><span>النموذج الافتراضي من إعدادات المزود</span><button disabled={busy || !input.trim()}>{busy ? "جارٍ التوليد…" : "إرسال ↑"}</button></div>
+          {attachments.length ? <div className="attachment-tray">{attachments.map((file) => (
+            <button type="button" key={file.id} onClick={() => setAttachments((items) => items.filter((item) => item.id !== file.id))}>
+              {file.content_type.startsWith("image/") ? "🖼" : "📎"} {file.file_name} ×
+            </button>
+          ))}</div> : null}
+          <div>
+            <label className="attach-button">＋ صورة أو ملف
+              <input type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,application/pdf,text/plain,text/markdown,text/csv,application/json" onChange={(event) => void uploadFiles(event.target.files)} />
+            </label>
+            <button disabled={busy || uploading || (!input.trim() && attachments.length === 0)}>{busy ? "جارٍ التوليد…" : uploading ? "جارٍ الرفع…" : "إرسال ↑"}</button>
+          </div>
         </form>
       </section>
       <aside className="context-panel">
         <h3>سياق المحادثة</h3>
-        <dl><div><dt>الحالة</dt><dd>{conversationId ? "محفوظة" : "جديدة"}</dd></div><div><dt>Streaming</dt><dd>مفعّل</dd></div><div><dt>الرسائل</dt><dd>{messages.length}</dd></div></dl>
+        <label>المزود<select value={providerId} onChange={(event) => {
+          const id = event.target.value;
+          setProviderId(id);
+          setModelId(providers.find((provider) => provider.id === id)?.default_model || "");
+        }}><option value="">اختر مزوداً</option>{providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select></label>
+        <label>النموذج<input dir="ltr" value={modelId} onChange={(event) => setModelId(event.target.value)} placeholder="model-id" /></label>
+        <dl><div><dt>الحالة</dt><dd>{conversationId ? "محفوظة" : "جديدة"}</dd></div><div><dt>مرفقات</dt><dd>حتى 8</dd></div><div><dt>الرسائل</dt><dd>{messages.length}</dd></div></dl>
         <div className="security-note"><b>خصوصية المفاتيح</b><p>فك التشفير يحدث داخل الخادم وقت الطلب فقط، ولا تصل المفاتيح إلى المتصفح.</p></div>
       </aside>
     </div>
@@ -282,8 +359,8 @@ function Login({ online, checking }: {
 }
 
 function Providers({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice) => void }) {
-  const [form, setForm] = useState({ name: "", base_url: "https://api.openai.com/v1", api_key: "", compatibility: "openai" });
-  const [providers, setProviders] = useState<Array<{ id: string; name: string; base_url: string; key_hint?: string }>>([]);
+  const [form, setForm] = useState({ name: "", base_url: "https://api.openai.com/v1", api_key: "", compatibility: "openai", default_model: "" });
+  const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const load = useCallback(async () => {
     try { setProviders(await request(apiBase, "/api/edge/providers")); } catch { setProviders([]); }
   }, [apiBase]);
@@ -294,14 +371,15 @@ function Providers({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Not
     event.preventDefault();
     try {
       await request(apiBase, "/api/edge/providers", { method: "POST", body: JSON.stringify(form) });
-      setForm({ ...form, name: "", api_key: "" }); await load();
+      setForm({ ...form, name: "", api_key: "", default_model: "" }); await load();
       setNotice({ tone: "ok", text: "حُفظ المزود ومفتاحه مشفراً." });
     } catch (error) { setNotice({ tone: "error", text: `تعذر حفظ المزود: ${String(error)}` }); }
   }
   async function test(id: string) {
     try {
-      const result = await request<{ ok: boolean; models_count?: number }>(apiBase, `/api/edge/providers/${id}/test`, { method: "POST" });
-      setNotice({ tone: result.ok ? "ok" : "error", text: result.ok ? `نجح الاتصال${result.models_count !== undefined ? ` — ${result.models_count} نموذجاً` : ""}.` : "فشل اختبار المزود." });
+      const result = await request<{ ok: boolean; models_count?: number; listing_supported?: boolean; default_model?: string }>(apiBase, `/api/edge/providers/${id}/test`, { method: "POST" });
+      await load();
+      setNotice({ tone: result.ok ? "ok" : "error", text: result.ok ? `نجح الاتصال — ${result.models_count || 0} نموذجاً${result.listing_supported ? "" : " (اختبار محادثة مباشر)"}. النموذج الافتراضي: ${result.default_model || "غير محدد"}` : "فشل اختبار المزود." });
     } catch (error) { setNotice({ tone: "error", text: `فشل الاختبار: ${String(error)}` }); }
   }
   return (
@@ -313,6 +391,7 @@ function Providers({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Not
           <label>الاسم<input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="OpenAI / OpenRouter / خادم خاص" /></label>
           <label>Base URL<input required dir="ltr" value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} /></label>
           <label>API Key<input required type="password" dir="ltr" value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} placeholder="sk-••••••••" /></label>
+          <label>معرّف النموذج الافتراضي<input dir="ltr" value={form.default_model} onChange={(e) => setForm({ ...form, default_model: e.target.value })} placeholder="gpt-4.1-mini أو اسم نموذج المزود" /><small className="field-help">مطلوب إذا كان المزود لا يدعم مسار /models.</small></label>
           <label>نوع التوافق<select value={form.compatibility} onChange={(e) => setForm({ ...form, compatibility: e.target.value })}><option value="openai">OpenAI-compatible (يشمل OpenAI وOpenRouter وGroq وغيرها)</option></select></label>
           <button className="primary-button">حفظ المزود بأمان</button>
         </form>
@@ -320,7 +399,7 @@ function Providers({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Not
           <h2>المزودات المحفوظة</h2>
           <div className="provider-list">
             {providers.length === 0 ? <p className="muted">لا توجد مزودات محفوظة في الخادم.</p> : providers.map((provider) => (
-              <article key={provider.id}><div><b>{provider.name}</b><small dir="ltr">{provider.base_url}</small><em>{provider.key_hint || "مفتاح مخفي"}</em></div><button onClick={() => void test(provider.id)}>اختبار وجلب النماذج</button></article>
+              <article key={provider.id}><div><b>{provider.name}</b><small dir="ltr">{provider.base_url}</small><em>{provider.key_hint || "مفتاح مخفي"} · {provider.default_model || "لا نموذج افتراضي"}</em></div><button onClick={() => void test(provider.id)}>اختبار وجلب النماذج</button></article>
             ))}
           </div>
         </section>
@@ -430,23 +509,108 @@ function Admin({ apiBase, online, setNotice }: { apiBase: string; online: boolea
   const cards = useMemo(() => [
     ["المستخدمون", metrics?.users],
     ["المحادثات", metrics?.conversations],
-    ["كل المهام", metrics?.jobs],
-    ["المهام الفاشلة", metrics?.failed_jobs],
+    ["المزودات", metrics?.providers],
+    ["الملفات", metrics?.files],
   ], [metrics]);
   return (
     <>
       <SectionHeading eyebrow="بيانات حقيقية" title="لوحة الإدارة" copy="تظهر القيم فقط عند توفرها من قاعدة البيانات؛ لا تستخدم الواجهة أرقاماً تجريبية." action={<button className="secondary-button" onClick={() => void load()}>تحديث</button>} />
       <div className="metric-grid">{cards.map(([label, value]) => <article className="metric-card" key={String(label)}><span>{label}</span><b>{value ?? "—"}</b><small>{metrics ? "من الخادم الآن" : "بانتظار الاتصال"}</small></article>)}</div>
-      <div className="two-column admin-bottom"><section className="card"><h2>صحة المكونات</h2>{["API", "PostgreSQL", "Redis", "Worker", "Telegram Webhook"].map((item, index) => <div className="health-row" key={item}><span>{item}</span><b className={online && index === 0 ? "healthy" : ""}>{online && index === 0 ? "متصل" : "غير متحقق"}</b></div>)}</section><section className="card"><h2>التدقيق والأمان</h2><p className="muted">يعرض هذا القسم أحدث سجلات التدقيق بعد تسجيل الدخول بصلاحية admin. لا تُرسل الواجهة أي بيانات سرية إلى خدمات قياس خارجية.</p><button className="secondary-button" onClick={() => setNotice({ tone: "info", text: "يتطلب هذا المسار جلسة Admin صالحة من الـBackend." })}>طلب سجل التدقيق</button></section></div>
+      <div className="two-column admin-bottom"><section className="card"><h2>صحة المكونات</h2>{[
+        ["Edge API", online],
+        ["D1 Database", Boolean(metrics?.database)],
+        ["R2 Storage", Boolean(metrics?.object_storage)],
+        ["Telegram Webhook", Boolean(metrics?.telegram_webhook)],
+        ["Container Worker", Boolean(metrics?.container_worker)],
+      ].map(([item, healthy]) => <div className="health-row" key={String(item)}><span>{String(item)}</span><b className={healthy ? "healthy" : ""}>{healthy ? "متصل" : "غير مفعّل"}</b></div>)}</section><section className="card"><h2>التدقيق والأمان</h2><p className="muted">البيانات الفعلية في D1 والملفات في R2. لا تُرسل الواجهة المفاتيح أو التوكنات إلى خدمات قياس خارجية.</p><button className="secondary-button" onClick={() => setNotice({ tone: "info", text: "كل عمليات المفاتيح والملفات وTelegram مسجلة في Audit Log." })}>حالة التدقيق</button></section></div>
     </>
   );
 }
 
-function Settings() {
+function Settings({ apiBase, setNotice }: { apiBase: string; setNotice: (n: Notice) => void }) {
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [telegram, setTelegram] = useState<{ configured: boolean; username?: string | null; webhook_ok?: boolean; pending_updates?: number; last_error?: string | null } | null>(null);
+  const [files, setFiles] = useState<UploadedFile[]>([]);
+
+  const load = useCallback(async () => {
+    const [telegramState, fileItems] = await Promise.all([
+      request<typeof telegram>(apiBase, "/api/edge/telegram/status"),
+      request<UploadedFile[]>(apiBase, "/api/edge/files"),
+    ]);
+    setTelegram(telegramState);
+    setFiles(fileItems);
+  }, [apiBase]);
+
+  useEffect(() => {
+    // Settings are synchronized from the server-owned integration state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load().catch(() => undefined);
+  }, [load]);
+
+  async function configure(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const result = await request<{ username?: string | null }>(apiBase, "/api/edge/telegram/configure", {
+        method: "POST",
+        body: JSON.stringify({ token }),
+      });
+      setToken("");
+      await load();
+      setNotice({ tone: "ok", text: `تم التحقق من البوت @${result.username || "بدون_اسم"} وتسجيل Webhook الآمن.` });
+    } catch (error) {
+      setNotice({ tone: "error", text: `تعذر تفعيل Telegram: ${String(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    try {
+      await request(apiBase, "/api/edge/telegram/configure", { method: "DELETE" });
+      await load();
+      setNotice({ tone: "ok", text: "تم حذف Webhook وبيانات Telegram المشفرة." });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeFile(id: string) {
+    await request(apiBase, `/api/edge/files/${id}`, { method: "DELETE" });
+    await load();
+  }
+
   return (
     <>
-      <SectionHeading eyebrow="تهيئة البيئة" title="الإعدادات" copy="الواجهة وEdge API يعملان الآن من النطاق نفسه، لذلك لا يلزم عنوان Backend أو إعداد CORS في المتصفح." />
-      <section className="card settings-card"><div className="security-note"><b>اتصال Same-Origin</b><p>المصادقة وقاعدة البيانات وواجهات المزودات تعمل داخل Sites. وظائف FFmpeg وSandbox ستتصل لاحقاً بWorker حاويات مخصص عبر قناة خادم آمنة.</p></div></section>
+      <SectionHeading eyebrow="تكاملات آمنة" title="الإعدادات والتخزين" copy="فعّل Telegram من هنا وأدر الملفات المحفوظة. التوكن لا يعود إلى المتصفح بعد حفظه." />
+      <div className="two-column">
+        <form className="card form-card" onSubmit={configure}>
+          <h2>Telegram Bot</h2>
+          <div className={`integration-state ${telegram?.webhook_ok ? "connected" : ""}`}>
+            <b>{telegram?.configured ? `@${telegram.username || "bot"}` : "غير متصل"}</b>
+            <span>{telegram?.webhook_ok ? "Webhook يعمل" : telegram?.configured ? "Webhook يحتاج فحصاً" : "أدخل التوكن الجديد بعد تدويره"}</span>
+          </div>
+          {telegram?.last_error ? <div className="login-error">{telegram.last_error}</div> : null}
+          <label>توكن البوت الجديد<input required={!telegram?.configured} type="password" dir="ltr" value={token} onChange={(event) => setToken(event.target.value)} placeholder="يُرسل مباشرة إلى Telegram ويُخزن مشفراً" /></label>
+          <button className="primary-button" disabled={busy || !token.trim()}>{busy ? "جارٍ التحقق…" : telegram?.configured ? "تدوير التوكن وإعادة الربط" : "تحقق وفعّل Webhook"}</button>
+          {telegram?.configured ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void disconnect()}>فصل Telegram وحذف التوكن</button> : null}
+          <small className="field-help">لن يظهر التوكن في الشاشة أو السجلات بعد الحفظ.</small>
+        </form>
+        <section className="card">
+          <h2>ملفاتي في التخزين</h2>
+          <div className="file-list">
+            {files.length === 0 ? <p className="muted">لا توجد ملفات بعد. ارفع صورة أو ملفاً من شاشة الدردشة.</p> : files.map((file) => (
+              <article key={file.id}>
+                <div><b>{file.content_type.startsWith("image/") ? "🖼" : "📎"} {file.file_name}</b><small>{(file.size_bytes / 1024).toFixed(1)} KB · {file.content_type}</small></div>
+                <span><a href={`/api/edge/files/${file.id}/content`} target="_blank" rel="noreferrer">فتح</a><button onClick={() => void removeFile(file.id)}>حذف</button></span>
+              </article>
+            ))}
+          </div>
+        </section>
+      </div>
+      <section className="card settings-card"><div className="security-note"><b>تخزين فعلي</b><p>البيانات المنظمة في D1، وملفات الصور والمستندات في R2، وكل استعلام أو تنزيل يتحقق من مالك الملف على الخادم.</p></div></section>
     </>
   );
 }
