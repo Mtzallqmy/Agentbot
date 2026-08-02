@@ -66,7 +66,7 @@ jobs:
           pytest -c apps/api/pyproject.toml apps/api/tests apps/bot/tests apps/worker/tests
           --cov=platform_api --cov=platform_worker
           --cov-report=term-missing --cov-report=xml --cov-fail-under=50
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: backend-coverage
