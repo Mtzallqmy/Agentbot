@@ -24,7 +24,7 @@ jobs:
     environment: production
     steps:
       - name: Deploy immutable main revision over SSH
-        uses: appleboy/ssh-action@v1.2.2
+        uses: appleboy/ssh-action@v1.2.5
         env:
           DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
           APP_PATH: ${{ secrets.DEPLOY_APP_PATH }}
